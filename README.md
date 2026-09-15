@@ -6,26 +6,26 @@ Streamlit web application comparing Baseline (Logistic Regression) vs Hybrid (LR
 
 ## Folder Structure
 
+```text
 Zander Etal/
 ├── models/
-│ ├── hybrid/
-│ │ ├── char_vectorizer.joblib
-│ │ ├── config.pkl
-│ │ ├── lightgbm_model.joblib
-│ │ ├── logistic_regression_model.joblib
-│ │ ├── scaler.joblib
-│ │ └── word_vectorizer.joblib
-│ └── baseline/
-│ ├── logistic_regression_model.joblib
-│ ├── model_config.json
-│ └── tfidf_vectorizer.joblib
+│   ├── hybrid/
+│   │   ├── char_vectorizer.joblib
+│   │   ├── config.pkl
+│   │   ├── lightgbm_model.joblib
+│   │   ├── logistic_regression_model.joblib
+│   │   ├── scaler.joblib
+│   │   └── word_vectorizer.joblib
+│   └── baseline/
+│       ├── logistic_regression_model.joblib
+│       ├── model_config.json
+│       └── tfidf_vectorizer.joblib
 ├── utils/
-│ └── preprocess.py
+│   └── preprocess.py
 ├── app.py
 ├── requirements.txt
 └── README.md
-
-text
+```
 
 ## Installation
 
