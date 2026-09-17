@@ -829,6 +829,7 @@ def render_analysis_page(models):
     def clear_email_input():
         st.session_state.email_input = ""
         st.session_state.sample_choice = "Custom Text"
+        st.session_state.analysis_results = None
 
     if "email_input" not in st.session_state:
         st.session_state.email_input = ""
