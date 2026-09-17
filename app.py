@@ -8,6 +8,7 @@ import sys
 import json
 import joblib
 import pickle
+from io import BytesIO
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -16,6 +17,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import time
 import re
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
 # Add utils to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -575,6 +577,177 @@ def display_prediction_card(result, model_name, color):
         
         st.markdown("</div>", unsafe_allow_html=True)
 
+
+BATCH_TEXT_COLUMNS = ["email_text", "body", "message", "Email Text", "Message", "text"]
+BATCH_LABEL_COLUMNS = ["label", "Category", "Email Type", "class", "target"]
+STYLOMETRIC_LABELS = [
+    "char_count",
+    "word_count",
+    "upper_ratio",
+    "exclamation_count",
+    "question_count",
+    "digit_ratio",
+    "url_count",
+    "urgency_ratio",
+    "entropy",
+]
+
+
+def read_batch_csv(uploaded_file):
+    """Read an uploaded CSV with UTF-8 first and latin-1 as a fallback."""
+    csv_bytes = uploaded_file.getvalue()
+    try:
+        return pd.read_csv(BytesIO(csv_bytes), encoding="utf-8")
+    except UnicodeDecodeError:
+        return pd.read_csv(BytesIO(csv_bytes), encoding="latin-1")
+
+
+def find_column(columns, candidates):
+    """Find a candidate column, accepting case differences and whitespace."""
+    normalized = {str(column).strip().lower(): column for column in columns}
+    for candidate in candidates:
+        match = normalized.get(candidate.lower())
+        if match is not None:
+            return match
+    return None
+
+
+def normalize_batch_label(value):
+    """Map common dataset labels to the app's standard class names."""
+    if pd.isna(value):
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "phishing email", "spam", "phishing"}:
+        return "Phishing"
+    if normalized in {"0", "safe email", "ham", "legitimate", "safe"}:
+        return "Legitimate"
+    return None
+
+
+def predict_batch(df, text_column, models, progress_callback=None):
+    """Run both available model pipelines for each row in a batch."""
+    results = []
+    total = len(df)
+    for index, raw_text in enumerate(df[text_column].fillna("")):
+        email_text = str(raw_text)
+        row_result = {
+            "email_text": email_text[:200],
+            "baseline_pred": "Unavailable",
+            "proposed_pred": "Unavailable",
+            "baseline_probability": np.nan,
+            "hybrid_probability": np.nan,
+            "hybrid_confidence": np.nan,
+            "discrepancy_flag": False,
+        }
+        try:
+            if models["replication"]["loaded"]:
+                baseline = predict_replication(
+                    email_text,
+                    models["replication"]["model"],
+                    models["replication"]["tfidf"],
+                )
+                row_result["baseline_pred"] = baseline["label"]
+                row_result["baseline_probability"] = baseline["phishing_probability"]
+            if models["hybrid"]["loaded"]:
+                proposed = predict_hybrid(email_text, models["hybrid"])
+                row_result["proposed_pred"] = proposed["label"]
+                row_result["hybrid_probability"] = proposed["final_proba"]
+                row_result["hybrid_confidence"] = proposed["confidence"]
+            if (
+                row_result["baseline_pred"] != "Unavailable"
+                and row_result["proposed_pred"] != "Unavailable"
+            ):
+                row_result["discrepancy_flag"] = (
+                    row_result["baseline_pred"] != row_result["proposed_pred"]
+                )
+        except Exception as error:
+            row_result["error"] = str(error)
+
+        features = extract_stylometrics(email_text)
+        row_result.update(dict(zip(STYLOMETRIC_LABELS, features)))
+        results.append(row_result)
+        if progress_callback:
+            progress_callback((index + 1) / max(total, 1))
+    return pd.DataFrame(results)
+
+
+def render_batch_results(source_df, batch_results, label_column):
+    """Render batch summary, optional benchmark metrics, table, and export."""
+    hybrid_predictions = batch_results["proposed_pred"]
+    phishing_count = (hybrid_predictions == "Phishing").sum()
+    legitimate_count = (hybrid_predictions == "Legitimate").sum()
+    mean_confidence = batch_results["hybrid_confidence"].mean()
+
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Total Emails Processed", len(batch_results))
+    metric_columns[1].metric("Phishing Count", int(phishing_count))
+    metric_columns[2].metric("Legitimate Count", int(legitimate_count))
+    metric_columns[3].metric(
+        "Mean Hybrid Confidence",
+        f"{mean_confidence * 100:.1f}%" if not pd.isna(mean_confidence) else "-",
+    )
+
+    if label_column:
+        evaluation_df = source_df[[label_column]].copy()
+        evaluation_df["actual"] = evaluation_df[label_column].map(normalize_batch_label)
+        valid_labels = evaluation_df["actual"].notna()
+        if valid_labels.any():
+            actual = evaluation_df.loc[valid_labels, "actual"]
+            metrics = []
+            for model_name, prediction_column in (
+                ("Baseline", "baseline_pred"),
+                ("Proposed", "proposed_pred"),
+            ):
+                valid_predictions = valid_labels & batch_results[prediction_column].isin(
+                    ["Phishing", "Legitimate"]
+                )
+                if not valid_predictions.any():
+                    continue
+                actual_predictions = evaluation_df.loc[valid_predictions, "actual"]
+                predictions = batch_results.loc[valid_predictions, prediction_column]
+                metrics.append({
+                    "Model": model_name,
+                    "Accuracy": accuracy_score(actual_predictions, predictions),
+                    "Precision": precision_score(actual_predictions, predictions, pos_label="Phishing", zero_division=0),
+                    "Recall": recall_score(actual_predictions, predictions, pos_label="Phishing", zero_division=0),
+                    "F1-Score": f1_score(actual_predictions, predictions, pos_label="Phishing", zero_division=0),
+                })
+            st.subheader("Benchmark / Evaluation")
+            if metrics:
+                st.dataframe(pd.DataFrame(metrics).set_index("Model").style.format("{:.3f}"), use_container_width=True)
+            else:
+                st.warning("No valid model predictions were available for evaluation.")
+        else:
+            st.warning("The detected label column has no recognized values, so evaluation metrics were skipped.")
+
+    st.subheader("Batch Results")
+    display_columns = [
+        "email_text", "baseline_pred", "proposed_pred", "hybrid_confidence", "discrepancy_flag"
+    ]
+    st.dataframe(
+        batch_results[display_columns].style.apply(
+            lambda row: [
+                "background-color: #fff3cd" if row["discrepancy_flag"] else ""
+                for _ in row
+            ],
+            axis=1,
+        ).format({"hybrid_confidence": "{:.3f}"}),
+        use_container_width=True,
+    )
+
+    export_df = source_df.copy()
+    for column in batch_results.columns:
+        if column == "email_text":
+            continue
+        export_df[column] = batch_results[column].values
+    st.download_button(
+        "Download Enriched Results",
+        data=export_df.to_csv(index=False).encode("utf-8"),
+        file_name="phishing_batch_results.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
 # ==============================================================================
 # SAMPLE EMAILS
 # ==============================================================================
@@ -661,33 +834,127 @@ def render_analysis_page(models):
         st.session_state.email_input = ""
     if "analysis_results" not in st.session_state:
         st.session_state.analysis_results = None
+    if "batch_results" not in st.session_state:
+        st.session_state.batch_results = None
+    if "batch_source_df" not in st.session_state:
+        st.session_state.batch_source_df = None
+    if "batch_label_column" not in st.session_state:
+        st.session_state.batch_label_column = None
+
+    input_mode = st.radio(
+        "Input mode",
+        ["Single Email", "Batch CSV Upload"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
     input_col, results_col = st.columns([55, 45], gap="large")
 
     with input_col:
         st.markdown('<div class="section-label">Email to analyze</div>', unsafe_allow_html=True)
-        st.selectbox(
-            "Test sample",
-            ["Custom Text"] + list(SAMPLE_EMAILS.keys()),
-            key="sample_choice",
-            on_change=select_sample,
-            label_visibility="collapsed",
-        )
-        email_text = st.text_area(
-            "Email content",
-            height=280,
-            placeholder="Paste email content here...",
-            key="email_input",
-            label_visibility="collapsed",
-        )
-        action_col1, action_col2 = st.columns([1, 1])
-        with action_col1:
-            analyze_btn = st.button(":material/search: Analyze Email", use_container_width=True, type="primary")
-        with action_col2:
-            st.button(":material/delete: Clear Input", use_container_width=True, on_click=clear_email_input)
+        if input_mode == "Single Email":
+            st.selectbox(
+                "Test sample",
+                ["Custom Text"] + list(SAMPLE_EMAILS.keys()),
+                key="sample_choice",
+                on_change=select_sample,
+                label_visibility="collapsed",
+            )
+            email_text = st.text_area(
+                "Email content",
+                height=280,
+                placeholder="Paste email content here...",
+                key="email_input",
+                label_visibility="collapsed",
+            )
+            action_col1, action_col2 = st.columns([1, 1])
+            with action_col1:
+                analyze_btn = st.button(":material/search: Analyze Email", use_container_width=True, type="primary")
+            with action_col2:
+                st.button(":material/delete: Clear Input", use_container_width=True, on_click=clear_email_input)
+        else:
+            sample_csv = pd.DataFrame({
+                "email_text": [
+                    "URGENT: Verify your account immediately at https://example.com",
+                    "Hi team, our meeting is confirmed for tomorrow at 10 AM.",
+                    "Your password expires today. Click here to reset it.",
+                ],
+                "label": ["Phishing Email", "Safe Email", "spam"],
+            })
+            st.download_button(
+                "Download Sample CSV Template",
+                data=sample_csv.to_csv(index=False).encode("utf-8"),
+                file_name="phishing_email_template.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            uploaded_file = st.file_uploader(
+                "Upload CSV file",
+                type=["csv"],
+                help="CSV files should contain an email text column and may include a label column.",
+            )
+            batch_process_btn = st.button(
+                ":material/upload: Process CSV",
+                use_container_width=True,
+                type="primary",
+                disabled=uploaded_file is None,
+            )
+
+            if uploaded_file is not None:
+                try:
+                    uploaded_df = read_batch_csv(uploaded_file)
+                except Exception as error:
+                    st.error(f"Unable to read CSV: {error}")
+                    uploaded_df = None
+
+                if uploaded_df is not None:
+                    if uploaded_df.empty:
+                        st.warning("The uploaded CSV contains no rows to process.")
+                    else:
+                        detected_text_column = find_column(uploaded_df.columns, BATCH_TEXT_COLUMNS)
+                        if detected_text_column is None:
+                            st.warning("No standard email text column was detected. Select one manually.")
+                            text_column = st.selectbox("Email text column", list(uploaded_df.columns))
+                        else:
+                            text_column = detected_text_column
+                            st.caption(f"Detected email text column: {text_column}")
+
+                        detected_label_column = find_column(uploaded_df.columns, BATCH_LABEL_COLUMNS)
+                        if detected_label_column:
+                            st.info(f"Benchmark / Evaluation Mode: using '{detected_label_column}' as the label column.")
+                        else:
+                            st.info("Prediction Only Mode: no recognized label column was found.")
+
+                        if batch_process_btn and text_column:
+                            progress_bar = st.progress(0, text="Generating batch predictions...")
+                            st.session_state.batch_results = predict_batch(
+                                uploaded_df,
+                                text_column,
+                                models,
+                                progress_callback=lambda value: progress_bar.progress(
+                                    value, text="Generating batch predictions..."
+                                ),
+                            )
+                            st.session_state.batch_source_df = uploaded_df
+                            st.session_state.batch_label_column = detected_label_column
+                            progress_bar.empty()
 
     with results_col:
         st.markdown('<div class="section-label">Live analysis</div>', unsafe_allow_html=True)
+
+        if input_mode == "Batch CSV Upload":
+            if st.session_state.batch_results is None:
+                st.markdown(
+                    '<div class="results-placeholder">Upload a CSV and process it to see batch results.</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                render_batch_results(
+                    st.session_state.batch_source_df,
+                    st.session_state.batch_results,
+                    st.session_state.batch_label_column,
+                )
+            return
 
     if analyze_btn and email_text.strip():
         with st.spinner("Analyzing email..."):
