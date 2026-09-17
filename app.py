@@ -759,10 +759,10 @@ https://suspicious-link.com/verify
 Failure to do so will result in permanent closure of your account.
     """,
     "Phishing - Password Reset": """
-Dear user,
-Your password will expire in 24 hours. 
-Please click here to reset your password now: https://fake-bank.com/reset
-If you do not reset your password, you will lose access to your account.
+URGENT: Your bank account has been locked due to suspicious activity. 
+Click here immediately to verify your identity and restore access: 
+http://secure-verify-portal.com/login. 
+Failure to verify within 24 hours will result in permanent suspension.
     """,
     "Phishing - Bank Alert": """
 ALERT: Unusual activity detected on your account.
